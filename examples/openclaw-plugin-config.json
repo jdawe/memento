@@ -1,0 +1,19 @@
+{
+  "plugins": {
+    "memory": "memory-lancedb",
+    "entries": {
+      "memory-lancedb": {
+        "enabled": true,
+        "config": {
+          "embedding": {
+            "apiKey": "ollama",
+            "model": "nomic-embed-text",
+            "baseURL": "http://127.0.0.1:11434/v1"
+          },
+          "autoCapture": true,
+          "autoRecall": true
+        }
+      }
+    }
+  }
+}
