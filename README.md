@@ -1,28 +1,27 @@
 # Memento
 
-Persistent two-layer memory for [OpenClaw](https://openclaw.ai). Fully local, zero vendor dependency.
+Persistent memory for [OpenClaw](https://openclaw.ai). Fully local, zero vendor dependency.
 
-- **Layer 1: Semantic Memory** — LanceDB + Ollama. Auto-captures facts, preferences, and decisions. Auto-recalls relevant context before each response.
-- **Layer 2: Verbatim Search** — SQLite FTS5 over session transcripts. Exact-match search across your entire conversation history.
+- **Verbatim Search** — SQLite FTS5 over session transcripts. Exact-match search across your entire conversation history. This is the primary, actively maintained feature.
+- **Semantic Memory** (optional) — LanceDB + Ollama plugin. Auto-captures facts, preferences, and decisions, and auto-recalls relevant context before each response.
 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Memento                           │
 │                                                     │
-│  ┌──────────────────┐    ┌───────────────────────┐  │
-│  │  Layer 1:        │    │  Layer 2:             │  │
-│  │  Semantic Memory │    │  Verbatim Search      │  │
-│  │                  │    │                       │  │
-│  │  LanceDB         │    │  SQLite + FTS5        │  │
-│  │  + Ollama        │    │  + JSONL indexer      │  │
-│  │  (nomic-embed)   │    │                       │  │
-│  │                  │    │                       │  │
-│  │  "What was that  │    │  "Find every message  │  │
-│  │   thing about    │    │   containing the word │  │
-│  │   budgets?"      │    │   'migration'"        │  │
-│  └──────────────────┘    └───────────────────────┘  │
+│  ┌───────────────────────┐  ┌──────────────────┐   │
+│  │  Verbatim Search      │  │  Semantic Memory  │   │
+│  │  (primary)            │  │  (optional)       │   │
+│  │                       │  │                   │   │
+│  │  SQLite + FTS5        │  │  LanceDB          │   │
+│  │  + JSONL indexer      │  │  + Ollama         │   │
+│  │                       │  │  (nomic-embed)    │   │
+│  │  "Find every message  │  │  "What was that   │   │
+│  │   containing the word │  │   thing about     │   │
+│  │   'migration'"        │  │   budgets?"       │   │
+│  └───────────────────────┘  └──────────────────┘   │
 │                                                     │
-│  Semantic ≈ fuzzy recall    Verbatim ≈ exact search │
+│  Verbatim ≈ exact search    Semantic ≈ fuzzy recall │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -36,7 +35,86 @@ Persistent two-layer memory for [OpenClaw](https://openclaw.ai). Fully local, ze
 
 ---
 
-## Layer 1: Semantic Memory (LanceDB)
+## Verbatim Search (SQLite FTS5)
+
+### Setup
+
+```bash
+# Clone this repo (or just grab scripts/transcript-search.py)
+git clone https://github.com/jdawe/memento.git
+cd memento
+
+# Run initial index
+python3 scripts/transcript-search.py index
+python3 scripts/transcript-search.py stats
+```
+
+### Configuration
+
+The script reads environment variables (with sensible defaults):
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEMENTO_SESSIONS_DIR` | `~/.openclaw/agents/main/sessions` | Path to OpenClaw JSONL session files |
+| `MEMENTO_CLAUDE_SESSIONS_DIR` | `~/.claude/projects/-Users-jd--openclaw-workspace` | Path to Claude Code JSONL session files (optional second source) |
+| `MEMENTO_DB_PATH` | `~/.openclaw/workspace/data/transcripts.db` | Path to the SQLite database |
+
+Override them if your setup differs:
+
+```bash
+MEMENTO_SESSIONS_DIR=/custom/path MEMENTO_DB_PATH=/custom/db.sqlite python3 scripts/transcript-search.py index
+```
+
+### Usage
+
+```bash
+# Search all conversations
+python3 scripts/transcript-search.py search "budget spreadsheet"
+
+# Filter by role and date range
+python3 scripts/transcript-search.py search "API migration" --role assistant --after 2026-03-01
+
+# Full message content (no truncation)
+python3 scripts/transcript-search.py search "architecture" --full --limit 5
+
+# Rebuild from scratch
+python3 scripts/transcript-search.py reindex
+
+# Remove cross-session duplicate messages (content-hash based)
+python3 scripts/transcript-search.py dedup
+
+# Show stats
+python3 scripts/transcript-search.py stats
+```
+
+### Auto-indexing
+
+Keep the index fresh with a cron job:
+
+```bash
+# Via OpenClaw cron (recommended):
+openclaw cron add transcript-indexer --every 30m \
+  --message "Run: bash /path/to/memento/scripts/transcript-index-cron.sh"
+
+# Or via system crontab:
+*/30 * * * * /path/to/memento/scripts/transcript-index-cron.sh
+```
+
+### How it works
+
+| Component | What it does |
+|---|---|
+| **JSONL parser** | Reads OpenClaw and Claude Code session transcripts (user, assistant, tool messages) |
+| **SQLite FTS5** | Full-text search index with BM25 ranking |
+| **Incremental indexing** | Only processes new/changed files (tracks by file size) |
+| **Cross-session dedup** | Content-hash based; run `dedup` to collapse duplicate messages across sources |
+| **Triggers** | FTS index auto-syncs on insert/update/delete |
+
+---
+
+## Semantic Memory (LanceDB, optional)
+
+Disabled by default. Enable it if you want automatic fact/preference capture and recall on top of verbatim search.
 
 ### Install Ollama
 
@@ -96,78 +174,6 @@ Data lives at `~/.openclaw/memory/lancedb/` (~1-5 MB per thousand memories).
 
 ---
 
-## Layer 2: Verbatim Search (SQLite FTS5)
-
-### Setup
-
-```bash
-# Clone this repo (or just grab scripts/transcript-search.py)
-git clone https://github.com/jdawe/memento.git
-cd memento
-
-# Run initial index
-python3 scripts/transcript-search.py index
-python3 scripts/transcript-search.py stats
-```
-
-### Configuration
-
-The script reads two environment variables (with sensible defaults):
-
-| Variable | Default | Description |
-|---|---|---|
-| `MEMENTO_SESSIONS_DIR` | `~/.openclaw/agents/main/sessions` | Path to OpenClaw JSONL session files |
-| `MEMENTO_DB_PATH` | `~/.openclaw/workspace/data/transcripts.db` | Path to the SQLite database |
-
-Override them if your setup differs:
-
-```bash
-MEMENTO_SESSIONS_DIR=/custom/path MEMENTO_DB_PATH=/custom/db.sqlite python3 scripts/transcript-search.py index
-```
-
-### Usage
-
-```bash
-# Search all conversations
-python3 scripts/transcript-search.py search "budget spreadsheet"
-
-# Filter by role and date range
-python3 scripts/transcript-search.py search "API migration" --role assistant --after 2026-03-01
-
-# Full message content (no truncation)
-python3 scripts/transcript-search.py search "architecture" --full --limit 5
-
-# Rebuild from scratch
-python3 scripts/transcript-search.py reindex
-
-# Show stats
-python3 scripts/transcript-search.py stats
-```
-
-### Auto-indexing
-
-Keep the index fresh with a cron job:
-
-```bash
-# Via OpenClaw cron (recommended):
-openclaw cron add transcript-indexer --every 30m \
-  --message "Run: bash /path/to/memento/scripts/transcript-index-cron.sh"
-
-# Or via system crontab:
-*/30 * * * * /path/to/memento/scripts/transcript-index-cron.sh
-```
-
-### How it works
-
-| Component | What it does |
-|---|---|
-| **JSONL parser** | Reads OpenClaw session transcripts (user, assistant, tool messages) |
-| **SQLite FTS5** | Full-text search index with BM25 ranking |
-| **Incremental indexing** | Only processes new/changed files (tracks by file size) |
-| **Triggers** | FTS index auto-syncs on insert/update/delete |
-
----
-
 ## When to use which layer
 
 | Question | Layer | Why |
@@ -177,7 +183,7 @@ openclaw cron add transcript-indexer --every 30m \
 | "Do I prefer dark mode?" | Semantic (LanceDB) | Preference recall |
 | "Show me everything from last Tuesday" | Verbatim (SQLite) | Date-filtered exact search |
 
-Semantic memory is **automatic** — it captures and recalls without you doing anything. Verbatim search is **on-demand** — run it when you need exact quotes or historical context.
+Verbatim search is **on-demand** — run it when you need exact quotes or historical context. Semantic memory (if enabled) is **automatic** — it captures and recalls without you doing anything.
 
 ---
 

@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -24,6 +25,7 @@ import sys
 from datetime import datetime, timezone
 
 SESSIONS_DIR = os.environ.get("MEMENTO_SESSIONS_DIR", os.path.expanduser("~/.openclaw/agents/main/sessions"))
+CLAUDE_SESSIONS_DIR = os.environ.get("MEMENTO_CLAUDE_SESSIONS_DIR", os.path.expanduser("~/.claude/projects/-Users-jd--openclaw-workspace"))
 DB_PATH = os.environ.get("MEMENTO_DB_PATH", os.path.expanduser("~/.openclaw/workspace/data/transcripts.db"))
 
 SCHEMA_SQL = """
@@ -36,6 +38,7 @@ CREATE TABLE IF NOT EXISTS messages (
     role TEXT,
     content TEXT,
     tool_name TEXT,
+    content_hash TEXT,
     UNIQUE(session_id, message_id)
 );
 
@@ -72,12 +75,36 @@ END;
 """
 
 
+def content_hash(role, content, timestamp):
+    """Hash of role + content + 5-second timestamp bucket for cross-session dedup."""
+    ts_bucket = timestamp[:18] if len(timestamp) >= 18 else timestamp
+    # Round seconds to nearest 5s bucket
+    if len(ts_bucket) >= 18:
+        try:
+            sec = int(ts_bucket[17:19]) if len(ts_bucket) >= 19 else int(ts_bucket[17:18])
+            ts_bucket = ts_bucket[:17] + str((sec // 5) * 5).zfill(2)
+        except ValueError:
+            pass
+    key = f"{role}:{ts_bucket}:{content[:500]}"
+    return hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
+
+
 def get_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA_SQL)
+    _migrate_content_hash(conn)
     return conn
+
+
+def _migrate_content_hash(conn):
+    """Add content_hash column if missing (one-time migration)."""
+    cur = conn.cursor()
+    cols = [row[1] for row in cur.execute("PRAGMA table_info(messages)")]
+    if "content_hash" not in cols:
+        cur.execute("ALTER TABLE messages ADD COLUMN content_hash TEXT")
+        conn.commit()
 
 
 def extract_content(content_field):
@@ -102,10 +129,15 @@ def extract_content(content_field):
 
 
 def parse_session_file(filepath):
-    """Parse a JSONL session file and yield message records."""
+    """Parse a JSONL session file and yield message records.
+
+    Handles two formats:
+    - OpenClaw: type="message", message.role, entry.id, entry.timestamp
+    - Claude Code: type="user"/"assistant", message.role, entry.uuid, entry.timestamp
+    """
     session_id = os.path.basename(filepath).replace(".jsonl", "")
     session_date = None
-    
+
     with open(filepath, "r", errors="replace") as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
@@ -117,31 +149,48 @@ def parse_session_file(filepath):
                 print(f"  Warning: malformed JSON at {session_id} line {line_num}, skipping", file=sys.stderr)
                 continue
 
-            # Extract session date from the session header
-            if entry.get("type") == "session" and not session_date:
+            entry_type = entry.get("type", "")
+
+            # OpenClaw: extract session date from the session header
+            if entry_type == "session" and not session_date:
                 ts = entry.get("timestamp", "")
                 if ts:
-                    session_date = ts[:10]  # YYYY-MM-DD
+                    session_date = ts[:10]
 
-            if entry.get("type") != "message":
+            # Determine if this is a message entry (OpenClaw or Claude Code format)
+            if entry_type == "message":
+                # OpenClaw format
+                msg = entry.get("message")
+                if not msg:
+                    continue
+                role = msg.get("role", "")
+                content = extract_content(msg.get("content"))
+                timestamp = entry.get("timestamp", "")
+                message_id = entry.get("id", f"line-{line_num}")
+                tool_name = msg.get("toolName", None)
+            elif entry_type in ("user", "assistant"):
+                # Claude Code format
+                msg = entry.get("message")
+                if not msg:
+                    continue
+                role = msg.get("role", entry_type)
+                raw_content = msg.get("content")
+                # Filter out 'thinking' blocks from assistant content
+                if isinstance(raw_content, list):
+                    raw_content = [c for c in raw_content if isinstance(c, dict) and c.get("type") != "thinking"]
+                content = extract_content(raw_content)
+                timestamp = entry.get("timestamp", "")
+                message_id = entry.get("uuid", f"line-{line_num}")
+                tool_name = None
+            else:
                 continue
 
-            msg = entry.get("message")
-            if not msg:
-                continue
-
-            role = msg.get("role", "")
-            content = extract_content(msg.get("content"))
             if content is None:
                 continue
 
             # Skip very short content (likely just whitespace or empty tool results)
             if len(content.strip()) < 2:
                 continue
-
-            timestamp = entry.get("timestamp", "")
-            message_id = entry.get("id", f"line-{line_num}")
-            tool_name = msg.get("toolName", None)
 
             if not session_date and timestamp:
                 session_date = timestamp[:10]
@@ -165,17 +214,21 @@ def cmd_index(conn, verbose=True):
     cur.execute("SELECT filename, file_size FROM indexed_files")
     indexed = {row[0]: row[1] for row in cur.fetchall()}
 
-    # Find all JSONL files (skip .deleted, .reset, .lock)
+    # Find all JSONL files from both OpenClaw and Claude Code session dirs
     files = []
     for f in os.listdir(SESSIONS_DIR):
         if f.endswith(".jsonl"):
-            files.append(f)
+            files.append((SESSIONS_DIR, f))
+    if os.path.isdir(CLAUDE_SESSIONS_DIR):
+        for f in os.listdir(CLAUDE_SESSIONS_DIR):
+            if f.endswith(".jsonl"):
+                files.append((CLAUDE_SESSIONS_DIR, f))
 
     new_count = 0
     msg_count = 0
 
-    for fname in sorted(files):
-        fpath = os.path.join(SESSIONS_DIR, fname)
+    for fdir, fname in sorted(files, key=lambda x: x[1]):
+        fpath = os.path.join(fdir, fname)
         fsize = os.path.getsize(fpath)
 
         if fname in indexed and indexed[fname] == fsize:
@@ -191,19 +244,29 @@ def cmd_index(conn, verbose=True):
 
         batch = []
         for rec in parse_session_file(fpath):
+            ch = content_hash(rec["role"], rec["content"], rec["timestamp"])
             batch.append((
                 rec["session_id"], rec["session_date"], rec["message_id"],
-                rec["timestamp"], rec["role"], rec["content"], rec["tool_name"]
+                rec["timestamp"], rec["role"], rec["content"], rec["tool_name"], ch
             ))
 
-        if batch:
-            cur.executemany(
+        inserted = 0
+        for row in batch:
+            ch = row[7]
+            # Skip if a message with the same content hash already exists (cross-session dedup)
+            existing = cur.execute(
+                "SELECT 1 FROM messages WHERE content_hash = ? LIMIT 1", (ch,)
+            ).fetchone()
+            if existing:
+                continue
+            cur.execute(
                 """INSERT OR IGNORE INTO messages
-                   (session_id, session_date, message_id, timestamp, role, content, tool_name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                batch
+                   (session_id, session_date, message_id, timestamp, role, content, tool_name, content_hash)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                row
             )
-            msg_count += len(batch)
+            inserted += 1
+        msg_count += inserted
 
         cur.execute(
             "INSERT OR REPLACE INTO indexed_files (filename, file_size, indexed_at) VALUES (?, ?, ?)",
@@ -231,6 +294,48 @@ def cmd_reindex(conn):
     conn.executescript(SCHEMA_SQL)
     print("Tables dropped and recreated. Re-indexing all files...")
     cmd_index(conn, verbose=True)
+
+
+def cmd_dedup(conn):
+    """Remove cross-session duplicate messages using content hashing."""
+    cur = conn.cursor()
+
+    # First, backfill content_hash for rows that don't have one
+    rows = cur.execute(
+        "SELECT id, role, content, timestamp FROM messages WHERE content_hash IS NULL"
+    ).fetchall()
+    if rows:
+        print(f"Backfilling content_hash for {len(rows)} messages...")
+        for row_id, role, content, ts in rows:
+            ch = content_hash(role, content or "", ts or "")
+            cur.execute("UPDATE messages SET content_hash = ? WHERE id = ?", (ch, row_id))
+        conn.commit()
+
+    # Find and remove duplicates: keep the earliest id for each content_hash
+    dupes = cur.execute("""
+        SELECT COUNT(*) FROM messages WHERE id NOT IN (
+            SELECT MIN(id) FROM messages WHERE content_hash IS NOT NULL GROUP BY content_hash
+        ) AND content_hash IS NOT NULL
+    """).fetchone()[0]
+
+    if dupes == 0:
+        print("No duplicates found.")
+        return
+
+    print(f"Removing {dupes} duplicate messages...")
+    cur.execute("""
+        DELETE FROM messages WHERE id NOT IN (
+            SELECT MIN(id) FROM messages WHERE content_hash IS NOT NULL GROUP BY content_hash
+        ) AND content_hash IS NOT NULL
+    """)
+    conn.commit()
+
+    # Rebuild FTS index
+    print("Rebuilding FTS index...")
+    cur.execute("DELETE FROM messages_fts")
+    cur.execute("INSERT INTO messages_fts(rowid, content, role) SELECT id, content, role FROM messages")
+    conn.commit()
+    print(f"Done. Removed {dupes} duplicates.")
 
 
 def format_timestamp(iso_ts):
@@ -347,6 +452,7 @@ def main():
     index_p = sub.add_parser("index", help="Incrementally index new/changed sessions")
     index_p.add_argument("--quiet", "-q", action="store_true", help="Suppress output")
     sub.add_parser("reindex", help="Drop and rebuild the full index")
+    sub.add_parser("dedup", help="Remove cross-session duplicate messages")
     sub.add_parser("stats", help="Show index statistics")
 
     search_p = sub.add_parser("search", help="Full-text search")
@@ -370,6 +476,8 @@ def main():
             cmd_index(conn, verbose=not getattr(args, 'quiet', False))
         elif args.command == "reindex":
             cmd_reindex(conn)
+        elif args.command == "dedup":
+            cmd_dedup(conn)
         elif args.command == "stats":
             cmd_stats(conn)
         elif args.command == "search":
