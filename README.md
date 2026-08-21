@@ -55,9 +55,10 @@ The script reads environment variables (with sensible defaults):
 
 | Variable | Default | Description |
 |---|---|---|
+| `MEMENTO_WORKSPACE_DIR` | `~/.openclaw/workspace` | Your OpenClaw workspace path; used to derive the Claude Code session dir below |
 | `MEMENTO_SESSIONS_DIR` | `~/.openclaw/agents/main/sessions` | Path to OpenClaw JSONL session files |
-| `MEMENTO_CLAUDE_SESSIONS_DIR` | `~/.claude/projects/-Users-jd--openclaw-workspace` | Path to Claude Code JSONL session files (optional second source) |
-| `MEMENTO_DB_PATH` | `~/.openclaw/workspace/data/transcripts.db` | Path to the SQLite database |
+| `MEMENTO_CLAUDE_SESSIONS_DIR` | auto-derived from `MEMENTO_WORKSPACE_DIR` (Claude Code slugifies the workspace path as its project dir name) | Path to Claude Code JSONL session files (optional second source) |
+| `MEMENTO_DB_PATH` | `$MEMENTO_WORKSPACE_DIR/data/transcripts.db` | Path to the SQLite database |
 
 Override them if your setup differs:
 

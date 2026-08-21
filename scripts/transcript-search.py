@@ -24,9 +24,20 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
+WORKSPACE_DIR = os.environ.get("MEMENTO_WORKSPACE_DIR", os.path.expanduser("~/.openclaw/workspace"))
+
+
+def _default_claude_sessions_dir():
+    """Claude Code slugifies its launch cwd (/ and . -> -) as its project dir name.
+    Derived from WORKSPACE_DIR, not os.getcwd() — this script runs from cron with an
+    unrelated cwd, so process cwd can't be trusted here."""
+    slug = WORKSPACE_DIR.replace("/", "-").replace(".", "-")
+    return os.path.expanduser(f"~/.claude/projects/{slug}")
+
+
 SESSIONS_DIR = os.environ.get("MEMENTO_SESSIONS_DIR", os.path.expanduser("~/.openclaw/agents/main/sessions"))
-CLAUDE_SESSIONS_DIR = os.environ.get("MEMENTO_CLAUDE_SESSIONS_DIR", os.path.expanduser("~/.claude/projects/-Users-jd--openclaw-workspace"))
-DB_PATH = os.environ.get("MEMENTO_DB_PATH", os.path.expanduser("~/.openclaw/workspace/data/transcripts.db"))
+CLAUDE_SESSIONS_DIR = os.environ.get("MEMENTO_CLAUDE_SESSIONS_DIR", _default_claude_sessions_dir())
+DB_PATH = os.environ.get("MEMENTO_DB_PATH", os.path.join(WORKSPACE_DIR, "data/transcripts.db"))
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS messages (
