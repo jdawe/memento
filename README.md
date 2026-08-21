@@ -55,10 +55,13 @@ The script reads environment variables (with sensible defaults):
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMENTO_WORKSPACE_DIR` | `~/.openclaw/workspace` | Your OpenClaw workspace path; used to derive the Claude Code session dir below |
+| `MEMENTO_WORKSPACE_DIR` | `~/.openclaw/workspace` | Your OpenClaw workspace path |
 | `MEMENTO_SESSIONS_DIR` | `~/.openclaw/agents/main/sessions` | Path to OpenClaw JSONL session files |
-| `MEMENTO_CLAUDE_SESSIONS_DIR` | auto-derived from `MEMENTO_WORKSPACE_DIR` (Claude Code slugifies the workspace path as its project dir name) | Path to Claude Code JSONL session files (optional second source) |
 | `MEMENTO_DB_PATH` | `$MEMENTO_WORKSPACE_DIR/data/transcripts.db` | Path to the SQLite database |
+
+Memento indexes OpenClaw agent sessions only — it operates at the harness level, not the
+underlying model CLI. If you drive a model directly (e.g. `claude` in a terminal, outside
+OpenClaw), that transcript isn't indexed.
 
 Override them if your setup differs:
 
@@ -105,7 +108,7 @@ openclaw cron add transcript-indexer --every 30m \
 
 | Component | What it does |
 |---|---|
-| **JSONL parser** | Reads OpenClaw and Claude Code session transcripts (user, assistant, tool messages) |
+| **JSONL parser** | Reads OpenClaw session transcripts (user, assistant, tool messages) |
 | **SQLite FTS5** | Full-text search index with BM25 ranking |
 | **Incremental indexing** | Only processes new/changed files (tracks by file size) |
 | **Cross-session dedup** | Content-hash based; run `dedup` to collapse duplicate messages across sources |

@@ -26,17 +26,7 @@ from datetime import datetime, timezone
 
 WORKSPACE_DIR = os.environ.get("MEMENTO_WORKSPACE_DIR", os.path.expanduser("~/.openclaw/workspace"))
 
-
-def _default_claude_sessions_dir():
-    """Claude Code slugifies its launch cwd (/ and . -> -) as its project dir name.
-    Derived from WORKSPACE_DIR, not os.getcwd() — this script runs from cron with an
-    unrelated cwd, so process cwd can't be trusted here."""
-    slug = WORKSPACE_DIR.replace("/", "-").replace(".", "-")
-    return os.path.expanduser(f"~/.claude/projects/{slug}")
-
-
 SESSIONS_DIR = os.environ.get("MEMENTO_SESSIONS_DIR", os.path.expanduser("~/.openclaw/agents/main/sessions"))
-CLAUDE_SESSIONS_DIR = os.environ.get("MEMENTO_CLAUDE_SESSIONS_DIR", _default_claude_sessions_dir())
 DB_PATH = os.environ.get("MEMENTO_DB_PATH", os.path.join(WORKSPACE_DIR, "data/transcripts.db"))
 
 SCHEMA_SQL = """
@@ -140,12 +130,7 @@ def extract_content(content_field):
 
 
 def parse_session_file(filepath):
-    """Parse a JSONL session file and yield message records.
-
-    Handles two formats:
-    - OpenClaw: type="message", message.role, entry.id, entry.timestamp
-    - Claude Code: type="user"/"assistant", message.role, entry.uuid, entry.timestamp
-    """
+    """Parse an OpenClaw JSONL session file and yield message records."""
     session_id = os.path.basename(filepath).replace(".jsonl", "")
     session_date = None
 
@@ -168,33 +153,17 @@ def parse_session_file(filepath):
                 if ts:
                     session_date = ts[:10]
 
-            # Determine if this is a message entry (OpenClaw or Claude Code format)
-            if entry_type == "message":
-                # OpenClaw format
-                msg = entry.get("message")
-                if not msg:
-                    continue
-                role = msg.get("role", "")
-                content = extract_content(msg.get("content"))
-                timestamp = entry.get("timestamp", "")
-                message_id = entry.get("id", f"line-{line_num}")
-                tool_name = msg.get("toolName", None)
-            elif entry_type in ("user", "assistant"):
-                # Claude Code format
-                msg = entry.get("message")
-                if not msg:
-                    continue
-                role = msg.get("role", entry_type)
-                raw_content = msg.get("content")
-                # Filter out 'thinking' blocks from assistant content
-                if isinstance(raw_content, list):
-                    raw_content = [c for c in raw_content if isinstance(c, dict) and c.get("type") != "thinking"]
-                content = extract_content(raw_content)
-                timestamp = entry.get("timestamp", "")
-                message_id = entry.get("uuid", f"line-{line_num}")
-                tool_name = None
-            else:
+            if entry_type != "message":
                 continue
+
+            msg = entry.get("message")
+            if not msg:
+                continue
+            role = msg.get("role", "")
+            content = extract_content(msg.get("content"))
+            timestamp = entry.get("timestamp", "")
+            message_id = entry.get("id", f"line-{line_num}")
+            tool_name = msg.get("toolName", None)
 
             if content is None:
                 continue
@@ -225,15 +194,11 @@ def cmd_index(conn, verbose=True):
     cur.execute("SELECT filename, file_size FROM indexed_files")
     indexed = {row[0]: row[1] for row in cur.fetchall()}
 
-    # Find all JSONL files from both OpenClaw and Claude Code session dirs
+    # Find all JSONL session files
     files = []
     for f in os.listdir(SESSIONS_DIR):
         if f.endswith(".jsonl"):
             files.append((SESSIONS_DIR, f))
-    if os.path.isdir(CLAUDE_SESSIONS_DIR):
-        for f in os.listdir(CLAUDE_SESSIONS_DIR):
-            if f.endswith(".jsonl"):
-                files.append((CLAUDE_SESSIONS_DIR, f))
 
     new_count = 0
     msg_count = 0
