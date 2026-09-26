@@ -29,6 +29,15 @@ WORKSPACE_DIR = os.environ.get("MEMENTO_WORKSPACE_DIR", os.path.expanduser("~/.o
 SESSIONS_DIR = os.environ.get("MEMENTO_SESSIONS_DIR", os.path.expanduser("~/.openclaw/agents/main/sessions"))
 DB_PATH = os.environ.get("MEMENTO_DB_PATH", os.path.join(WORKSPACE_DIR, "data/transcripts.db"))
 
+# OpenClaw 2026.9.4 moved live session transcripts out of per-session .jsonl files
+# (SESSIONS_DIR above) into this agent-owned SQLite store's transcript_events table.
+# Old jsonl indexing is kept for historical files already on disk; new activity is
+# read incrementally from AGENT_DB_PATH via cmd_index_sqlite.
+AGENT_DB_PATH = os.environ.get(
+    "MEMENTO_AGENT_DB_PATH",
+    os.path.expanduser("~/.openclaw/agents/main/agent/openclaw-agent.sqlite"),
+)
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -46,6 +55,12 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS indexed_files (
     filename TEXT PRIMARY KEY,
     file_size INTEGER,
+    indexed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS indexed_sqlite_sessions (
+    session_id TEXT PRIMARY KEY,
+    max_seq INTEGER,
     indexed_at TEXT
 );
 
@@ -258,6 +273,175 @@ def cmd_index(conn, verbose=True):
         else:
             print(f"Indexed {new_count} file(s), {msg_count} message(s) added.")
 
+    cmd_index_sqlite(conn, verbose=verbose)
+
+
+def _decompress_zstd_event(blob, max_output_bytes):
+    """Decompress an event_zstd blob back to its JSON string, or None if unavailable.
+
+    OpenClaw started storing larger transcript events zlib/zstd-compressed
+    (event_json NULL, event_zstd populated) at some point after this indexer
+    was written — plain Node zlib.zstdCompressSync frames, no custom
+    dictionary. Requires `pip3 install --user zstandard`; without it, these
+    rows are skipped (not crashed on) so the rest of the index still builds.
+    """
+    global _ZSTD_MODULE, _ZSTD_WARNED
+    if _ZSTD_MODULE is None:
+        try:
+            import zstandard as _zstd
+            _ZSTD_MODULE = _zstd
+        except ImportError:
+            _ZSTD_MODULE = False
+            if not _ZSTD_WARNED:
+                print(
+                    "  Warning: 'zstandard' package not installed — compressed transcript events "
+                    "(event_zstd) will be skipped. Install with: pip3 install --user zstandard",
+                    file=sys.stderr,
+                )
+                _ZSTD_WARNED = True
+    if _ZSTD_MODULE is False:
+        return None
+    try:
+        dctx = _ZSTD_MODULE.ZstdDecompressor()
+        return dctx.decompress(blob, max_output_size=max_output_bytes or 0).decode("utf-8")
+    except Exception as e:
+        print(f"  Warning: failed to decompress event_zstd blob: {e}", file=sys.stderr)
+        return None
+
+
+_ZSTD_MODULE = None
+_ZSTD_WARNED = False
+
+
+def parse_agent_db_events(agent_db_path, since_seq_by_session):
+    """Read new transcript_events rows from the OpenClaw agent SQLite store.
+
+    Yields message records in the same shape as parse_session_file, plus the
+    highest seq seen per session_id so the caller can persist a resume point.
+    """
+    src = sqlite3.connect(f"file:{agent_db_path}?mode=ro", uri=True)
+    try:
+        cur = src.cursor()
+        rows = cur.execute(
+            "SELECT session_id, seq, event_json, event_zstd, event_utf8_bytes "
+            "FROM transcript_events ORDER BY session_id, seq"
+        ).fetchall()
+    finally:
+        src.close()
+
+    session_dates = {}
+    max_seq = dict(since_seq_by_session)
+
+    for session_id, seq, event_json, event_zstd, event_utf8_bytes in rows:
+        floor = since_seq_by_session.get(session_id, -1)
+        if seq <= floor:
+            continue
+
+        if event_json is None and event_zstd is not None:
+            event_json = _decompress_zstd_event(event_zstd, event_utf8_bytes)
+
+        if event_json is None:
+            # No plain JSON and no usable compressed payload (missing zstd lib,
+            # bad frame, or a genuinely empty row) — skip, don't crash the run.
+            max_seq[session_id] = max(max_seq.get(session_id, -1), seq)
+            continue
+
+        try:
+            entry = json.loads(event_json)
+        except json.JSONDecodeError:
+            print(f"  Warning: malformed event_json at {session_id} seq {seq}, skipping", file=sys.stderr)
+            max_seq[session_id] = max(max_seq.get(session_id, -1), seq)
+            continue
+
+        entry_type = entry.get("type", "")
+        max_seq[session_id] = max(max_seq.get(session_id, -1), seq)
+
+        if entry_type == "session":
+            ts = entry.get("timestamp", "")
+            if ts:
+                session_dates[session_id] = ts[:10]
+            continue
+
+        if entry_type != "message":
+            continue
+
+        msg = entry.get("message")
+        if not msg:
+            continue
+        role = msg.get("role", "")
+        content = extract_content(msg.get("content"))
+        timestamp = entry.get("timestamp", "")
+        message_id = entry.get("id", f"{session_id}-seq{seq}")
+        tool_name = msg.get("toolName", None)
+
+        if content is None:
+            continue
+        if len(content.strip()) < 2:
+            continue
+
+        session_date = session_dates.get(session_id) or (timestamp[:10] if timestamp else "")
+
+        yield {
+            "session_id": session_id,
+            "session_date": session_date,
+            "message_id": message_id,
+            "timestamp": timestamp,
+            "role": role,
+            "content": content,
+            "tool_name": tool_name,
+        }, max_seq
+
+
+def cmd_index_sqlite(conn, verbose=True):
+    """Incrementally index new messages from the OpenClaw agent SQLite transcript store."""
+    if not os.path.exists(AGENT_DB_PATH):
+        if verbose:
+            print(f"  Agent DB not found at {AGENT_DB_PATH}, skipping sqlite source.")
+        return 0, 0
+
+    cur = conn.cursor()
+    cur.execute("SELECT session_id, max_seq FROM indexed_sqlite_sessions")
+    since_seq_by_session = {row[0]: row[1] for row in cur.fetchall()}
+
+    new_msg_count = 0
+    final_max_seq = dict(since_seq_by_session)
+
+    for rec, max_seq in parse_agent_db_events(AGENT_DB_PATH, since_seq_by_session):
+        final_max_seq = max_seq
+        ch = content_hash(rec["role"], rec["content"], rec["timestamp"])
+        existing = cur.execute(
+            "SELECT 1 FROM messages WHERE content_hash = ? LIMIT 1", (ch,)
+        ).fetchone()
+        if existing:
+            continue
+        cur.execute(
+            """INSERT OR IGNORE INTO messages
+               (session_id, session_date, message_id, timestamp, role, content, tool_name, content_hash)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rec["session_id"], rec["session_date"], rec["message_id"],
+             rec["timestamp"], rec["role"], rec["content"], rec["tool_name"], ch)
+        )
+        new_msg_count += 1
+
+    now = datetime.now(timezone.utc).isoformat()
+    for session_id, seq in final_max_seq.items():
+        if since_seq_by_session.get(session_id) == seq:
+            continue  # unchanged
+        cur.execute(
+            "INSERT OR REPLACE INTO indexed_sqlite_sessions (session_id, max_seq, indexed_at) VALUES (?, ?, ?)",
+            (session_id, seq, now)
+        )
+
+    conn.commit()
+
+    if verbose:
+        if new_msg_count == 0:
+            print("Agent DB source: up to date — no new messages.")
+        else:
+            print(f"Agent DB source: {new_msg_count} message(s) added.")
+
+    return len(final_max_seq), new_msg_count
+
 
 def cmd_reindex(conn):
     """Drop and rebuild the full index."""
@@ -266,6 +450,7 @@ def cmd_reindex(conn):
     cur.execute("DROP TABLE IF EXISTS messages_fts")
     cur.execute("DROP TABLE IF EXISTS messages")
     cur.execute("DROP TABLE IF EXISTS indexed_files")
+    cur.execute("DROP TABLE IF EXISTS indexed_sqlite_sessions")
     conn.commit()
     conn.executescript(SCHEMA_SQL)
     print("Tables dropped and recreated. Re-indexing all files...")
