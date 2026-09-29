@@ -2,8 +2,8 @@
 # Cron-ready wrapper for transcript indexing.
 # Scheduled via ~/Library/LaunchAgents/com.openclaw.transcript-index.plist
 # (source: workspace launch-agents/com.openclaw.transcript-index.plist),
-# every 30 min. This indexer had NO schedule at all until 2026-09-26 — memory
-# claimed "every 5 minutes, 100% verbatim coverage"; it was actually stale
+# every 5 min (consolidated from crontab + 30-min plist on 2026-09-29). The
+# indexer was stale
 # since whenever compressed transcript_events rows (event_zstd, added by
 # OpenClaw sometime after 2026-07-31) started appearing and crashing every
 # manual run with an uncaught TypeError on the None event_json.

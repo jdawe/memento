@@ -97,11 +97,11 @@ Keep the index fresh with a cron job:
 
 ```bash
 # Via OpenClaw cron (recommended):
-openclaw cron add transcript-indexer --every 30m \
+openclaw cron add transcript-indexer --every 5m \
   --message "Run: bash /path/to/memento/scripts/transcript-index-cron.sh"
 
 # Or via system crontab:
-*/30 * * * * /path/to/memento/scripts/transcript-index-cron.sh
+*/5 * * * * /path/to/memento/scripts/transcript-index-cron.sh
 ```
 
 ### How it works
